@@ -91,6 +91,10 @@
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/merge_operators/sortlist.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
+#include "util/zipf.h"
+#include "util/pareto.h"
+#include "util/latest-generator.h"
+
 
 #ifdef MEMKIND
 #include "memory/memkind_kmem_allocator.h"
@@ -165,6 +169,12 @@ IF_ROCKSDB_LITE("",
     "readrandomoperands,"
     "backup,"
     "restore"
+    "ycsbwklda,"
+    "ycsbwkldb,"
+    "ycsbwkldc,"
+    "ycsbwkldd,"
+    "ycsbwklde,"
+    "ycsbwkldf,"
 
     "Comma-separated list of operations to run in the specified"
     " order. Available benchmarks:\n"
@@ -1253,6 +1263,13 @@ DEFINE_uint64(
     "Rocksdb implicit readahead is enabled if reads are sequential and "
     "num_file_reads_for_auto_readahead indicates after how many sequential "
     "reads into that file internal auto prefetching should be start.");
+
+// For YCSB
+DEFINE_int32(op_num, 0, "Number of operations to do.");
+DEFINE_bool(YCSB_uniform_distribution, false, "Use Uniform key distribution for YCSB");
+DEFINE_double(skewness, 0.99, "Skewness for Zipfian Distribution");
+DEFINE_int32(hotspot_num, 1, "Number of hotspot regions");
+DEFINE_int32(hotspot_distance, 1000000, "Distance for hotspots in different threads");
 
 static enum ROCKSDB_NAMESPACE::CompressionType StringToCompressionType(
     const char* ctype) {
@@ -3658,7 +3675,21 @@ class Benchmark {
       } else if (name == "restore") {
         method = &Benchmark::Restore;
 #endif
-      } else if (!name.empty()) {  // No error message for empty name
+      } else if (name == "ycsbwklda") {
+        method = &Benchmark::YCSBWorkloadA;
+      } 
+      // else if (name == "ycsbwkldb") {
+      //   method = &Benchmark::YCSBWorkloadB;
+      // } else if (name == "ycsbwkldc") {
+      //   method = &Benchmark::YCSBWorkloadC;
+      // } else if (name == "ycsbwkldd") {
+      //   method = &Benchmark::YCSBWorkloadD;
+      // } else if (name == "ycsbwklde") {
+      //   method = &Benchmark::YCSBWorkloadE;
+      // } else if (name == "ycsbwkldf") {
+      //   method = &Benchmark::YCSBWorkloadF;
+      // } 
+      else if (!name.empty()) {  // No error message for empty name
         fprintf(stderr, "unknown benchmark '%s'\n", name.c_str());
         ErrorExit();
       }
@@ -8148,6 +8179,96 @@ class Benchmark {
       thread->stats.Stop();
       thread->stats.Report("timeseries write");
     }
+  }
+
+  // Workload A: Update heavy workload
+  // This workload has a mix of 50/50 reads and writes. 
+  // An application example is a session store recording recent actions.
+  // Read/update ratio: 50/50
+  // Default data size: 1 KB records 
+  // Request distribution: zipfian
+  void YCSBWorkloadA(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    //init_zipf_generator(0, FLAGS_num, 0.99);
+    int hotspot_idx = 0;
+    std::string value;
+    int64_t found = 0;
+	
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(0, FLAGS_op_num);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    //WriteBatch batch;
+    if (FLAGS_benchmark_write_rate_limit > 0) {
+       printf(">>>> FLAGS_benchmark_write_rate_limit YCSBA \n");
+      thread->shared->write_rate_limiter.reset(
+          NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
+    }
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+       
+          long k;
+          if (FLAGS_YCSB_uniform_distribution){
+            //Generate number from uniform distribution            
+            k = thread->rand.Next() % FLAGS_num;
+          } else { //default
+            //Generate number from zipf distribution
+            k = nextValue(thread->tid * FLAGS_hotspot_distance + ((hotspot_idx++)%FLAGS_hotspot_num)  * 100000) % FLAGS_num;            
+       	    //k = nextValue() % FLAGS_num;	
+	        }
+          GenerateKeyFromInt(k, FLAGS_num, &key);
+
+          int next_op = thread->rand.Next() % 100;
+          if (next_op < 50){
+            //read
+            Status s = db->Get(options, key, &value);
+            if (!s.ok() && !s.IsNotFound()) {
+              //fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
+              
+	            //exit(1);
+              // we continue after error rather than exiting so that we can
+              // find more errors if any
+            } else if (!s.IsNotFound()) {
+              found++;
+              thread->stats.FinishedOps(nullptr, db, 1, kRead);
+            }
+            reads_done++;
+            
+          } else{
+            //write
+            if (FLAGS_benchmark_write_rate_limit > 0) {
+                
+                thread->shared->write_rate_limiter->Request(
+                    value_size + key_size_, Env::IO_HIGH,
+                    nullptr /* stats */, RateLimiter::OpType::kWrite);
+                thread->stats.ResetLastOpTime();
+            }
+           Status s = db->Put(write_options_, key, gen.Generate(value_size));
+	          //batch.Put(key, gen.Generate(value_size_));
+           //Status s = db->Write(write_options_, &batch); 
+           //batch.Clear(); 
+           if (!s.ok()) {
+              fprintf(stderr, "thread %d, key %ld, put error: %s\n", thread->tid, k, s.ToString().c_str());
+              //exit(1);
+            } else{
+             writes_done++;
+             thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+            }                
+      }
+
+
+
+    } 
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
   }
 
   void Compact(ThreadState* thread) {
