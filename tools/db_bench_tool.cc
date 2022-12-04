@@ -8190,8 +8190,9 @@ class Benchmark {
   void YCSBWorkloadA(ThreadState* thread) {
     ReadOptions options(FLAGS_verify_checksum, true);
     RandomGenerator gen;
+    // Initialize the zipf distribution for YCSB
+    init_zipf_generator(0, FLAGS_num, FLAGS_skewness);
     init_latestgen(FLAGS_num);
-    //init_zipf_generator(0, FLAGS_num, 0.99);
     int hotspot_idx = 0;
     std::string value;
     int64_t found = 0;
